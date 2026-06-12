@@ -1,0 +1,263 @@
+name: Build & publish skynet CUDA image
+
+# Builds the DEFAULT (CUDA/GPU) image of upstream jitsi/skynet and pushes it to
+# this repo's GitHub Container Registry namespace. Upstream is checked out fresh
+# for every build (this fork's own copy is never used for the build), so the
+# published image always tracks real jitsi/skynet source — not fork drift.
+#
+# A GPU is NOT needed to build, only to run, so a standard GitHub-hosted runner
+# is fine.
+
+on:
+  # Manual run — pick the jitsi/skynet ref you want to build.
+  workflow_dispatch:
+    inputs:
+      skynet_ref:
+        description: "jitsi/skynet git ref to build (branch, tag, or full SHA)"
+        type: string
+        default: "master"
+  # Weekly: pick up new upstream commits and CUDA base-image security rebuilds.
+  # The `check` job below skips the (expensive) build when nothing changed.
+  schedule:
+    - cron: "25 5 * * 1" # Mondays 05:25 UTC
+  # Validate the workflow itself whenever it (or the Renovate config) is edited.
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/build.yml"
+      - ".github/renovate.json"
+
+# Built-in GITHUB_TOKEN needs to push packages; checkout only needs read.
+permissions:
+  contents: read
+  packages: write
+
+# Never run two publishes of the same image concurrently.
+concurrency:
+  group: build-skynet-cuda
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: jitsi/skynet
+  IMAGE_NAME: skynet
+  # On a scheduled run, rebuild even with no detected change once the published
+  # image is at least this old (catches CUDA base-image security rebuilds whose
+  # tag digest we may not otherwise notice).
+  STALE_AFTER_DAYS: "14"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Decide whether we actually need to build, and compute image name + tags.
+  # Manual and push runs always build. Scheduled runs only build when the
+  # upstream source SHA or the CUDA base-image digest differs from what is
+  # recorded on the currently-published :cuda image (or it is stale). The whole
+  # gate is fail-open: any lookup error results in a build, never a silent skip.
+  # ---------------------------------------------------------------------------
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      reason: ${{ steps.decide.outputs.reason }}
+      image: ${{ steps.meta.outputs.image }}
+      tags: ${{ steps.meta.outputs.tags }}
+      created: ${{ steps.meta.outputs.created }}
+      skynet_ref: ${{ steps.resolve.outputs.ref }}
+      skynet_sha: ${{ steps.resolve.outputs.sha }}
+      skynet_short_sha: ${{ steps.resolve.outputs.short_sha }}
+    steps:
+      - name: Resolve upstream skynet ref -> commit SHA
+        id: resolve
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.skynet_ref }}"
+          [ -z "$REF" ] && REF="master"
+          # Resolve a branch/tag to its commit SHA without cloning; if the ref is
+          # already a raw SHA, ls-remote returns nothing and we use it verbatim.
+          SHA="$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" "$REF" | head -n1 | cut -f1 || true)"
+          [ -z "$SHA" ] && SHA="$REF"
+          {
+            echo "ref=$REF"
+            echo "sha=$SHA"
+            echo "short_sha=${SHA:0:7}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved ${UPSTREAM_REPO}@${REF} -> ${SHA}"
+
+      - name: Compute image name + tags
+        id: meta
+        run: |
+          set -euo pipefail
+          OWNER_LC="${GITHUB_REPOSITORY_OWNER,,}"            # GHCR requires lowercase
+          IMAGE="ghcr.io/${OWNER_LC}/${IMAGE_NAME}"
+          DATE="$(date -u +%Y%m%d)"
+          CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          VERSION_TAG="cuda-${DATE}-${{ steps.resolve.outputs.short_sha }}"
+          {
+            echo "image=$IMAGE"
+            echo "created=$CREATED"
+            echo "tags<<EOF"
+            echo "$IMAGE:cuda"
+            echo "$IMAGE:latest"
+            echo "$IMAGE:$VERSION_TAG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # The crane lookups below only matter for the scheduled change-detection
+      # gate, so we only authenticate / install crane for scheduled runs.
+      - name: Log in to GHCR (for image inspection)
+        if: github.event_name == 'schedule'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up crane
+        if: github.event_name == 'schedule'
+        uses: imjasonh/setup-crane@59c71e96a00b28651f10369ba3359a6d730740a0 # v0.6
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          set -uo pipefail
+          IMAGE="${{ steps.meta.outputs.image }}"
+          SKYNET_SHA="${{ steps.resolve.outputs.sha }}"
+
+          # Manual + push runs: always build.
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "build=true"  >> "$GITHUB_OUTPUT"
+            echo "reason=event '${{ github.event_name }}' always builds" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Scheduled run: inspect the published :cuda image config (labels only,
+          # no layer download). If it is missing/unreadable, fail open -> build.
+          CFG="$(crane config "$IMAGE:cuda" 2>/dev/null || true)"
+          if [ -z "$CFG" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "reason=no readable published image -> build" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PUB_SHA="$(echo "$CFG"     | jq -r '.config.Labels["skynet.source.revision"] // empty')"
+          PUB_BASE="$(echo "$CFG"    | jq -r '.config.Labels["skynet.base.digest"]      // empty')"
+          PUB_CREATED="$(echo "$CFG" | jq -r '.config.Labels["org.opencontainers.image.created"] // empty')"
+
+          # Current CUDA runtime base digest (read BASE_IMAGE_RUN from upstream's
+          # Dockerfile at this exact commit; default to the known CUDA base).
+          BASE_RUN="$(curl -fsSL "https://raw.githubusercontent.com/${UPSTREAM_REPO}/${SKYNET_SHA}/Dockerfile" 2>/dev/null \
+                       | sed -n 's/^ARG BASE_IMAGE_RUN=//p' | head -n1)"
+          [ -z "$BASE_RUN" ] && BASE_RUN="nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04"
+          BASE_DIGEST="$(crane digest "$BASE_RUN" 2>/dev/null || true)"
+
+          REASON=""
+          if [ "$PUB_SHA" != "$SKYNET_SHA" ]; then
+            REASON="skynet source changed (${PUB_SHA:-none} -> ${SKYNET_SHA})"
+          elif [ -n "$BASE_DIGEST" ] && [ "$BASE_DIGEST" != "$PUB_BASE" ]; then
+            REASON="CUDA base image changed (${PUB_BASE:-none} -> ${BASE_DIGEST})"
+          elif [ -n "$PUB_CREATED" ]; then
+            AGE=$(( ( $(date -u +%s) - $(date -u -d "$PUB_CREATED" +%s) ) / 86400 ))
+            [ "$AGE" -ge "${STALE_AFTER_DAYS}" ] && REASON="published image is ${AGE}d old (>= ${STALE_AFTER_DAYS}d)"
+          fi
+
+          if [ -n "$REASON" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "reason=$REASON" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "reason=up to date (skynet ${SKYNET_SHA}, base & freshness unchanged)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "### skynet CUDA build — decision"
+            echo ""
+            echo "- upstream: \`${UPSTREAM_REPO}@${{ steps.resolve.outputs.ref }}\` -> \`${{ steps.resolve.outputs.sha }}\`"
+            echo "- build: **${{ steps.decide.outputs.build }}**"
+            echo "- reason: ${{ steps.decide.outputs.reason }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Build the CUDA image with upstream's default build args and push to GHCR.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      # CUDA + PyTorch + vLLM is multi-GB and overflows the default runner disk,
+      # so reclaim space before building.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Check out upstream jitsi/skynet (NOT this fork)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check.outputs.skynet_sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve CUDA base-image digest (recorded as a label for the gate)
+        id: base
+        run: |
+          set -uo pipefail
+          BASE_RUN="$(sed -n 's/^ARG BASE_IMAGE_RUN=//p' Dockerfile | head -n1)"
+          [ -z "$BASE_RUN" ] && BASE_RUN="nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04"
+          DIGEST="$(docker buildx imagetools inspect "$BASE_RUN" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"' || true)"
+          echo "run=$BASE_RUN"   >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST"  >> "$GITHUB_OUTPUT"
+
+      - name: Build & push CUDA image (upstream default args)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # No build-args: upstream defaults are already the CUDA bases.
+          platforms: linux/amd64
+          push: true
+          # Single-platform manifest with no attestation manifest, so simple pull
+          # tools (that choke on multi-manifest images) can handle it.
+          provenance: false
+          sbom: false
+          tags: ${{ needs.check.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.title=skynet (CUDA)
+            org.opencontainers.image.description=CUDA/GPU build of jitsi/skynet (Faster-Whisper streaming transcription for Jitsi Meet)
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.revision=${{ needs.check.outputs.skynet_sha }}
+            org.opencontainers.image.created=${{ needs.check.outputs.created }}
+            skynet.source.repository=${{ env.UPSTREAM_REPO }}
+            skynet.source.ref=${{ needs.check.outputs.skynet_ref }}
+            skynet.source.revision=${{ needs.check.outputs.skynet_sha }}
+            skynet.base.image=${{ steps.base.outputs.run }}
+            skynet.base.digest=${{ steps.base.outputs.digest }}
+
+      - name: Summary
+        run: |
+          {
+            echo "### Pushed skynet CUDA image"
+            echo ""
+            echo "Source: \`${UPSTREAM_REPO}@${{ needs.check.outputs.skynet_sha }}\`"
+            echo ""
+            echo '```'
+            echo "${{ needs.check.outputs.tags }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

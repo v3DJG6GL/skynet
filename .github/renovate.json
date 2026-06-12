@@ -1,0 +1,29 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":semanticCommits",
+    ":dependencyDashboard"
+  ],
+  "timezone": "Etc/UTC",
+  "labels": ["dependencies"],
+  "_comment_managers": "Only manage GitHub Actions. This fork's Python/Docker deps never affect the published image (it is built from upstream jitsi/skynet directly), so leaving them to Renovate would just create noise and upstream-merge conflicts.",
+  "enabledManagers": ["github-actions"],
+  "automerge": true,
+  "automergeStrategy": "squash",
+  "platformAutomerge": true,
+  "packageRules": [
+    {
+      "description": "Group all GitHub Actions bumps (build.yml is SHA-pinned; Renovate keeps both the SHA and the # vN comment current).",
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions"
+    },
+    {
+      "description": "Major bumps are surfaced on the Dependency Dashboard for manual approval rather than auto-merged.",
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "dependencyDashboardApproval": true
+    }
+  ]
+}
